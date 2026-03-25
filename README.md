@@ -1,6 +1,6 @@
 ﻿# SpreadsheetApp — WorkElate Task Assessment
  
-Hello Team i done Please take a look on it !!
+Hello Team i done all Task Please take a look on it !!
 
 ## ✅ Scope Covered
 
