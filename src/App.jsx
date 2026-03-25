@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useMemo } from 'react'
+import { useState, useRef, useCallback, useMemo, useEffect } from 'react'
 import './App.css'
 import { createEngine } from './engine/core.js'
 
@@ -12,13 +12,110 @@ export default function App() {
   const [version, setVersion] = useState(0)
   const [selectedCell, setSelectedCell] = useState(null)
   const [editingCell, setEditingCell] = useState(null)
+  const [rowOrder, setRowOrder] = useState(Array.from({ length: TOTAL_ROWS }, (_, i) => i))
   const [editValue, setEditValue] = useState('')
+  const [loadError, setLoadError] = useState(null)
+  const [sortConfig, setSortConfig] = useState({ col: null, direction: 'none' })
+  const [filterState, setFilterState] = useState({})
+  const [filterInputs, setFilterInputs] = useState({})
+  const [activeFilterCol, setActiveFilterCol] = useState(null)
+  const [selectedRange, setSelectedRange] = useState(null)
+  const [internalClipboard, setInternalClipboard] = useState(null)
+
+  const LOCAL_STORAGE_KEY = 'ai-spreadsheet-state-v1'
+
   // Cell styles are stored separately from engine data
   // Format: { "row,col": { bold: bool, italic: bool, ... } }
   const [cellStyles, setCellStyles] = useState({})
   const cellInputRef = useRef(null)
 
+  // ────── Filtering and Sorting ──────
+
+  const visibleRows = useMemo(() => {
+    let rows = Array.from({ length: engine.rows }, (_, i) => i)
+
+    // Apply filters
+    rows = rows.filter(rowIndex => {
+      for (const [colStr, filterValue] of Object.entries(filterState)) {
+        if (!filterValue || filterValue.trim() === '') continue
+        const col = parseInt(colStr)
+        const cellData = engine.getCell(rowIndex, col)
+        const displayValue = String(cellData.computed !== null && cellData.computed !== '' ? cellData.computed : cellData.raw).toLowerCase()
+        if (!displayValue.includes(filterValue.toLowerCase())) {
+          return false
+        }
+      }
+      return true
+    })
+
+    // Apply sort
+    if (sortConfig.col !== null && sortConfig.direction !== 'none') {
+      rows.sort((rowA, rowB) => {
+        const cellA = engine.getCell(rowA, sortConfig.col)
+        const cellB = engine.getCell(rowB, sortConfig.col)
+
+        const valueA = cellA.computed !== null && cellA.computed !== '' ? cellA.computed : cellA.raw
+        const valueB = cellB.computed !== null && cellB.computed !== '' ? cellB.computed : cellB.raw
+
+        const numA = parseFloat(valueA)
+        const numB = parseFloat(valueB)
+
+        let comparison = 0
+        if (!isNaN(numA) && !isNaN(numB)) {
+          comparison = numA - numB
+        } else {
+          const strA = String(valueA).toLowerCase()
+          const strB = String(valueB).toLowerCase()
+          comparison = strA.localeCompare(strB)
+        }
+
+        return sortConfig.direction === 'asc' ? comparison : -comparison
+      })
+    }
+
+    return rows
+  }, [engine, filterState, sortConfig, version])
+
   const forceRerender = useCallback(() => setVersion(v => v + 1), [])
+
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(LOCAL_STORAGE_KEY)
+      if (!saved) return
+      const parsed = JSON.parse(saved)
+      if (parsed && parsed.engineState) {
+        engine.hydrate(parsed.engineState)
+        setCellStyles(parsed.cellStyles || {})
+        setRowOrder(Array.from({ length: engine.rows }, (_, i) => i))
+        setVersion(v => v + 1)
+      }
+    } catch (err) {
+      console.error('Failed to load spreadsheet state from localStorage', err)
+      setLoadError('Storage data invalid (reset)')
+      localStorage.removeItem(LOCAL_STORAGE_KEY)
+    }
+  }, [engine])
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      try {
+        const state = {
+          engineState: engine.serialize(),
+          cellStyles,
+          rowOrder
+        }
+        localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(state))
+      } catch (err) {
+        if (err instanceof DOMException && (err.name === 'QuotaExceededError' || err.name === 'NS_ERROR_DOM_QUOTA_REACHED')) {
+          console.error('LocalStorage quota exceeded, cannot save spreadsheet state', err)
+        } else {
+          console.error('Failed to save spreadsheet state to localStorage', err)
+        }
+      }
+    }, 500)
+
+    return () => clearTimeout(timer)
+  }, [engine, cellStyles, rowOrder, version])
 
   // ────── Cell style helpers ──────
 
@@ -58,14 +155,27 @@ export default function App() {
     setEditingCell(null)
   }, [engine, editValue, forceRerender])
 
-  const handleCellClick = useCallback((row, col) => {
+  const handleCellClick = useCallback((event, row, col) => {
     if (editingCell && (editingCell.r !== row || editingCell.c !== col)) {
       commitEdit(editingCell.r, editingCell.c)
     }
+
+    const newRange = event.shiftKey && selectedCell
+      ? {
+        r1: Math.min(selectedCell.r, row),
+        c1: Math.min(selectedCell.c, col),
+        r2: Math.max(selectedCell.r, row),
+        c2: Math.max(selectedCell.c, col)
+      }
+      : { r1: row, c1: col, r2: row, c2: col }
+
+    setSelectedRange(newRange)
+    setSelectedCell({ r: row, c: col })
+
     if (!editingCell || editingCell.r !== row || editingCell.c !== col) {
       startEditing(row, col)
     }
-  }, [editingCell, commitEdit, startEditing])
+  }, [editingCell, commitEdit, selectedCell, startEditing])
 
   // ────── Keyboard navigation ──────
 
@@ -229,6 +339,201 @@ export default function App() {
     }
   }, [selectedCell, engine, forceRerender])
 
+  // ────── Sort & Filter handlers ──────
+
+  const handleSortColumn = useCallback((col) => {
+    setSortConfig(prev => {
+      if (prev.col === col) {
+        // Cycle direction
+        if (prev.direction === 'asc') return { col, direction: 'desc' }
+        if (prev.direction === 'desc') return { col, direction: 'none' }
+        return { col, direction: 'asc' }
+      } else {
+        // New column, start with asc
+        return { col, direction: 'asc' }
+      }
+    })
+  }, [])
+
+  const parseClipboardText = useCallback((text) => {
+    if (!text || typeof text !== 'string') return []
+    const rows = text.split(/\r?\n/)
+      // Remove final empty row from trailing newline
+      .filter((row, idx, arr) => !(idx === arr.length - 1 && row.trim() === ''))
+      .map(row => row.split('\t'))
+    return rows
+  }, [])
+
+  const pasteTextToGrid = useCallback((text) => {
+    if (!text || !selectedCell) return
+
+    const clipboardTable = parseClipboardText(text)
+    if (clipboardTable.length === 0) return
+
+    const pasteStart = selectedRange || selectedCell
+    const startRow = pasteStart?.r1 !== undefined ? pasteStart.r1 : pasteStart.r
+    const startCol = pasteStart?.c1 !== undefined ? pasteStart.c1 : pasteStart.c
+
+    if (startRow === undefined || startCol === undefined) return
+
+    setInternalClipboard(clipboardTable)
+
+    const maxRow = startRow + clipboardTable.length - 1
+    const maxCol = startCol + Math.max(...clipboardTable.map(row => row.length)) - 1
+
+    console.log('Pasting data table:', clipboardTable)
+
+    for (let r = 0; r < clipboardTable.length; r++) {
+      for (let c = 0; c < clipboardTable[r].length; c++) {
+        const targetRow = startRow + r
+        const targetCol = startCol + c
+        if (targetRow >= engine.rows || targetCol >= engine.cols) continue
+        engine.setCell(targetRow, targetCol, clipboardTable[r][c])
+      }
+    }
+
+    forceRerender()
+    setSelectedCell({ r: Math.min(maxRow, engine.rows - 1), c: Math.min(maxCol, engine.cols - 1) })
+    setSelectedRange({ r1: startRow, c1: startCol, r2: Math.min(maxRow, engine.rows - 1), c2: Math.min(maxCol, engine.cols - 1) })
+  }, [engine, forceRerender, parseClipboardText, selectedCell])
+
+  const handlePaste = useCallback((e) => {
+    e.preventDefault()
+    const text = e.clipboardData?.getData('text') || ''
+    console.log('Paste event text:', JSON.stringify(text))
+    pasteTextToGrid(text)
+  }, [pasteTextToGrid])
+
+  const pasteClipboard = useCallback(async () => {
+    if (!selectedCell) return
+
+    let text = ''
+    try {
+      if (navigator.clipboard && navigator.clipboard.readText) {
+        text = await navigator.clipboard.readText()
+      }
+    } catch (err) {
+      console.warn('Navigator clipboard readText failed, using internal clipboard fallback', err)
+    }
+
+    if (text && text.trim() !== '') {
+      pasteTextToGrid(text)
+      return
+    }
+
+    // fallback to internal clipboard
+    if (internalClipboard && internalClipboard.length > 0) {
+      const clipboardTable = internalClipboard
+      const startRow = selectedCell.r
+      const startCol = selectedCell.c
+
+      for (let r = 0; r < clipboardTable.length; r++) {
+        for (let c = 0; c < clipboardTable[r].length; c++) {
+          const targetRow = startRow + r
+          const targetCol = startCol + c
+          if (targetRow >= engine.rows || targetCol >= engine.cols) continue
+          engine.setCell(targetRow, targetCol, clipboardTable[r][c])
+        }
+      }
+
+      forceRerender()
+      const maxRow = startRow + clipboardTable.length - 1
+      const maxCol = startCol + Math.max(...clipboardTable.map(row => row.length)) - 1
+      setSelectedCell({ r: Math.min(maxRow, engine.rows - 1), c: Math.min(maxCol, engine.cols - 1) })
+      setSelectedRange({ r1: startRow, c1: startCol, r2: Math.min(maxRow, engine.rows - 1), c2: Math.min(maxCol, engine.cols - 1) })
+    }
+  }, [engine, forceRerender, internalClipboard, pasteTextToGrid, selectedCell])
+
+  const handleFilterChange = useCallback((col, value) => {
+    setFilterInputs(prev => ({ ...prev, [col]: value }))
+    setFilterState(prev => {
+      if (!value || value.trim() === '') {
+        const next = { ...prev }
+        delete next[col]
+        return next
+      } else {
+        return { ...prev, [col]: value }
+      }
+    })
+  }, [])
+
+  const handleClearFilter = useCallback((col) => {
+    setFilterInputs(prev => ({ ...prev, [col]: '' }))
+    setFilterState(prev => {
+      const next = { ...prev }
+      delete next[col]
+      return next
+    })
+  }, [])
+
+  const normalizeRange = useCallback((range) => {
+    if (!range) return null
+    const r1 = Math.min(range.r1, range.r2)
+    const r2 = Math.max(range.r1, range.r2)
+    const c1 = Math.min(range.c1, range.c2)
+    const c2 = Math.max(range.c1, range.c2)
+    return { r1, r2, c1, c2 }
+  }, [])
+
+  const getSelectedRange = useCallback(() => {
+    if (!selectedRange && selectedCell) {
+      return { r1: selectedCell.r, r2: selectedCell.r, c1: selectedCell.c, c2: selectedCell.c }
+    }
+    return normalizeRange(selectedRange)
+  }, [selectedCell, selectedRange, normalizeRange])
+
+  const copySelectedRange = useCallback(async () => {
+    const range = getSelectedRange()
+    if (!range) return
+
+    const rows = []
+    for (let r = range.r1; r <= range.r2; r++) {
+      const cols = []
+      for (let c = range.c1; c <= range.c2; c++) {
+        const cell = engine.getCell(r, c)
+        let value = cell.computed
+        if (value === null || value === undefined || value === '') value = cell.raw || ''
+        cols.push(value)
+      }
+      rows.push(cols)
+    }
+
+    const tsv = rows.map(r => r.map(item => String(item ?? '')).join('\t')).join('\n')
+    setInternalClipboard(rows)
+
+    console.log('Copy range TSV:\n' + tsv)
+
+    try {
+      await navigator.clipboard.writeText(tsv)
+      console.log('Copied data to clipboard successfully')
+    } catch (err) {
+      console.warn('Clipboard write failed:', err)
+    }
+  }, [engine, getSelectedRange])
+
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if (!event.ctrlKey && !event.metaKey) return
+
+      if (event.key === 'c' || event.key === 'C') {
+        event.preventDefault()
+        copySelectedRange()
+      } else if (event.key === 'v' || event.key === 'V') {
+        event.preventDefault()
+        pasteClipboard()
+      }
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [copySelectedRange, pasteClipboard])
+
+  const handleClearAllFilters = useCallback(() => {
+    setFilterInputs({})
+    setFilterState({})
+    setSortConfig({ col: null, direction: 'none' })
+  }, [])
+
   // ────── Derived state ──────
 
   const selectedCellStyle = useMemo(() => {
@@ -260,7 +565,7 @@ export default function App() {
   // ────── Render ──────
 
   return (
-    <div className="app-wrapper">
+    <div className="app-wrapper" onPaste={handlePaste}>
       <div className="app-header">
         <h2 className="app-title">📊 Spreadsheet App</h2>
       </div>
@@ -321,6 +626,10 @@ export default function App() {
           </div>
 
           <div className="toolbar-group">
+            <button className="toolbar-btn" onClick={handleClearAllFilters} title="Clear all sorts and filters">🔄 Reset</button>
+          </div>
+
+          <div className="toolbar-group">
             <button className="toolbar-btn" onClick={insertRow} title="Insert Row">+ Row</button>
             <button className="toolbar-btn" onClick={deleteRow} title="Delete Row">- Row</button>
             <button className="toolbar-btn" onClick={insertColumn} title="Insert Column">+ Col</button>
@@ -354,16 +663,56 @@ export default function App() {
                 <th className="col-header-blank"></th>
                 {Array.from({ length: engine.cols }, (_, colIndex) => (
                   <th key={colIndex} className="col-header">
-                    {getColumnLabel(colIndex)}
+                    <div className="col-header-content">
+                      <div className="col-header-label" onClick={() => handleSortColumn(colIndex)} style={{ cursor: 'pointer', flex: 1 }}>
+                        {getColumnLabel(colIndex)}
+                        {sortConfig.col === colIndex && sortConfig.direction !== 'none' && (
+                          <span className="sort-indicator" title={sortConfig.direction === 'asc' ? 'Ascending' : 'Descending'}>
+                            {sortConfig.direction === 'asc' ? ' ↑' : ' ↓'}
+                          </span>
+                        )}
+                      </div>
+                      <div className="col-header-filter">
+                        <button
+                          className="filter-btn"
+                          onClick={() => setActiveFilterCol(activeFilterCol === colIndex ? null : colIndex)}
+                          title="Filter"
+                          style={{
+                            background: filterState[colIndex] ? '#1a73e8' : '#f8f9fa',
+                            color: filterState[colIndex] ? '#fff' : '#5f6368',
+                          }}
+                        >
+                          ⋮
+                        </button>
+                        {activeFilterCol === colIndex && (
+                          <div className="filter-dropdown">
+                            <input
+                              type="text"
+                              className="filter-input"
+                              placeholder="Filter..."
+                              value={filterInputs[colIndex] || ''}
+                              onChange={(e) => handleFilterChange(colIndex, e.target.value)}
+                              autoFocus
+                            />
+                            {filterState[colIndex] && (
+                              <button className="filter-clear-btn" onClick={() => handleClearFilter(colIndex)}>
+                                Clear
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    </div>
                   </th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {Array.from({ length: engine.rows }, (_, rowIndex) => (
+              {visibleRows.map((rowIndex) => (
                 <tr key={rowIndex}>
                   <td className="row-header">{rowIndex + 1}</td>
                   {Array.from({ length: engine.cols }, (_, colIndex) => {
+                    const inRange = selectedRange && rowIndex >= Math.min(selectedRange.r1, selectedRange.r2) && rowIndex <= Math.max(selectedRange.r1, selectedRange.r2) && colIndex >= Math.min(selectedRange.c1, selectedRange.c2) && colIndex <= Math.max(selectedRange.c1, selectedRange.c2)
                     const isSelected = selectedCell?.r === rowIndex && selectedCell?.c === colIndex
                     const isEditing = editingCell?.r === rowIndex && editingCell?.c === colIndex
                     const cellData = engine.getCell(rowIndex, colIndex)
@@ -375,13 +724,14 @@ export default function App() {
                     return (
                       <td
                         key={colIndex}
-                        className={`cell ${isSelected ? 'selected' : ''}`}
+                        className={`cell ${isSelected || inRange ? 'selected' : ''}`}
                         style={{ background: style.bg || 'white' }}
-                        onMouseDown={(e) => { e.preventDefault(); handleCellClick(rowIndex, colIndex) }}
+                        onMouseDown={(e) => { e.preventDefault(); handleCellClick(e, rowIndex, colIndex) }}
                       >
                         {isEditing ? (
                           <input
                             autoFocus
+                            onPaste={handlePaste}
                             className="cell-input"
                             value={editValue}
                             onChange={(e) => setEditValue(e.target.value)}

@@ -903,6 +903,52 @@ export function createEngine(initialRows = 50, initialCols = 50) {
     // All cell operations go through the public methods which handle undo/redo,
     // dependency tracking, and cache invalidation automatically
 
+    function serialize() {
+        const savedCells = []
+        for (const [key, value] of cells.entries()) {
+            savedCells.push({ key, raw: value.raw })
+        }
+        return {
+            rows,
+            cols,
+            cells: savedCells
+        }
+    }
+
+    function hydrate(state) {
+        if (!state || typeof state !== 'object') return
+        const nextRows = Number.isInteger(state.rows) ? state.rows : rows
+        const nextCols = Number.isInteger(state.cols) ? state.cols : cols
+
+        rows = nextRows
+        cols = nextCols
+        cells.clear()
+        graph.clear()
+        computedCache.clear()
+        dirtyCells.clear()
+        undoStack.length = 0
+        redoStack.length = 0
+        _generation++
+
+        if (Array.isArray(state.cells)) {
+            for (const item of state.cells) {
+                if (!item || typeof item !== 'object' || typeof item.key !== 'string') continue
+                const coords = parseCellKey(item.key)
+                if (!coords) continue
+                if (coords.row >= 0 && coords.row < rows && coords.col >= 0 && coords.col < cols) {
+                    setCellRaw(coords.row, coords.col, item.raw || '')
+                }
+            }
+        }
+
+        for (const [key, value] of cells.entries()) {
+            if (value.raw && value.raw.startsWith('=')) updateDependencies(key, value.raw)
+        }
+
+        markAllCellsDirty()
+        recalculate()
+    }
+
     return {
         get rows() { return rows },
         get cols() { return cols },
@@ -916,6 +962,8 @@ export function createEngine(initialRows = 50, initialCols = 50) {
         redo,
         canUndo: () => undoStack.length > 0,
         canRedo: () => redoStack.length > 0,
+        serialize,
+        hydrate,
         // Internal state is not exposed - if you need to serialize/deserialize,
         // you'll need to work with the public API or add new methods
     }
